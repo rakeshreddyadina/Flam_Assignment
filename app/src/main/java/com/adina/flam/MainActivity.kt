@@ -28,20 +28,14 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Keep screen on and set to fullscreen
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         makeFullscreen()
-
         setContentView(R.layout.activity_main)
 
-        // Initialize views and executor
         glSurfaceView = findViewById(R.id.glSurfaceView)
         cameraExecutor = Executors.newSingleThreadExecutor()
 
-        // Check for camera permission before setting up the camera
-        if (allPermissionsGranted()) {
-            setupCamera()
-        } else {
+        if (!allPermissionsGranted()) {
             ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
         }
     }
@@ -58,14 +52,12 @@ class MainActivity : AppCompatActivity() {
         glSurfaceView.setEGLContextClientVersion(2)
         glSurfaceView.setPreserveEGLContextOnPause(true)
 
-        // Get display rotation and create the renderer
-        val rotation = windowManager.defaultDisplay.rotation
-        cameraRenderer = CameraRenderer(rotation) { surfaceTexture ->
+        // THIS IS THE FIX: The rotation parameter has been removed to match the new CameraRenderer.
+        cameraRenderer = CameraRenderer { surfaceTexture ->
             startCamera(surfaceTexture)
         }
 
         glSurfaceView.setRenderer(cameraRenderer)
-        // Set to continuous rendering for a smooth video feed
         glSurfaceView.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
     }
 
@@ -75,14 +67,13 @@ class MainActivity : AppCompatActivity() {
         cameraProviderFuture.addListener({
             val cameraProvider = cameraProviderFuture.get()
 
-            // Build a high-quality camera preview
             val preview = Preview.Builder()
                 .setTargetRotation(windowManager.defaultDisplay.rotation)
                 .build()
                 .also {
                     it.setSurfaceProvider { request ->
                         val resolution = request.resolution
-                        // Pass camera resolution to the renderer for aspect ratio calculations
+                        Log.d(TAG, "Camera resolution: ${resolution.width}x${resolution.height}")
                         cameraRenderer.setCameraPreviewSize(resolution.width, resolution.height)
                         surfaceTexture.setDefaultBufferSize(resolution.width, resolution.height)
 
@@ -108,33 +99,30 @@ class MainActivity : AppCompatActivity() {
         ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
     }
 
-    override fun onRequestPermissionsResult(
-        requestCode: Int, permissions: Array<String>, grantResults: IntArray
-    ) {
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQUEST_CODE_PERMISSIONS) {
-            if (allPermissionsGranted()) {
-                setupCamera()
-            } else {
-                Log.e(TAG, "Permissions not granted by the user.")
+            if (!allPermissionsGranted()) {
+                Log.e(TAG, "Permissions not granted.")
                 finish()
             }
+            // onResume will handle the camera setup now that permissions are granted.
         }
     }
 
-    // Handle GLSurfaceView lifecycle
     override fun onResume() {
         super.onResume()
-        if (::glSurfaceView.isInitialized) {
+        if (allPermissionsGranted()) {
+            if (!::cameraRenderer.isInitialized) {
+                setupCamera()
+            }
             glSurfaceView.onResume()
         }
     }
 
     override fun onPause() {
         super.onPause()
-        if (::glSurfaceView.isInitialized) {
-            glSurfaceView.onPause()
-        }
+        if (::glSurfaceView.isInitialized) glSurfaceView.onPause()
     }
 
     override fun onDestroy() {
@@ -146,10 +134,7 @@ class MainActivity : AppCompatActivity() {
         private const val TAG = "FlamApp"
         private const val REQUEST_CODE_PERMISSIONS = 10
         private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA)
-
-        init {
-            System.loadLibrary("flam")
-        }
+        init { System.loadLibrary("flam") }
     }
 
     private external fun stringFromJNI(): String

@@ -6,57 +6,38 @@ import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.opengl.Matrix
 import android.util.Log
-import android.view.Surface
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
-import java.nio.ShortBuffer
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 
 class CameraRenderer(
-    private val displayRotation: Int,
     private val onSurfaceTextureCreated: (SurfaceTexture) -> Unit
 ) : GLSurfaceView.Renderer {
 
     private lateinit var surfaceTexture: SurfaceTexture
     private var textureId: Int = 0
 
-    // Matrices for transforming the video feed
+    private val transformMatrix = FloatArray(16)
     private val mvpMatrix = FloatArray(16)
-    private val projectionMatrix = FloatArray(16)
-    private val viewMatrix = FloatArray(16)
-    private val textureMatrix = FloatArray(16)
 
-    // Screen and camera dimensions
-    private var surfaceWidth: Int = 0
-    private var surfaceHeight: Int = 0
-    private var previewWidth: Int = 0
-    private var previewHeight: Int = 0
-
-    // OpenGL program and variable handles
-    private var program: Int = 0
-    private var positionHandle: Int = 0
-    private var texCoordHandle: Int = 0
-    private var mvpMatrixHandle: Int = 0
-    private var texMatrixHandle: Int = 0
-
-    // Buffers for drawing the image quad
-    private val vertexBuffer: FloatBuffer
-    private val texCoordBuffer: FloatBuffer
-    private val drawListBuffer: ShortBuffer
+    private var screenWidth: Int = 0
+    private var screenHeight: Int = 0
+    private var cameraWidth: Int = 0
+    private var cameraHeight: Int = 0
 
     private val vertexShaderCode = """
-        uniform mat4 uMVPMatrix;
-        uniform mat4 uTexMatrix;
         attribute vec4 aPosition;
         attribute vec4 aTexCoord;
         varying vec2 vTexCoord;
+        uniform mat4 uMVPMatrix;
+        uniform mat4 uTexMatrix;
         void main() {
             gl_Position = uMVPMatrix * aPosition;
             vTexCoord = (uTexMatrix * aTexCoord).xy;
         }
-    """.trimIndent()
+    """
 
     private val fragmentShaderCode = """
         #extension GL_OES_EGL_image_external : require
@@ -66,127 +47,187 @@ class CameraRenderer(
         void main() {
             gl_FragColor = texture2D(sTexture, vTexCoord);
         }
-    """.trimIndent()
+    """
+
+    private val vertexBuffer: FloatBuffer
+    private val texCoordBuffer: FloatBuffer
+
+    private var program: Int = 0
+    private var mvpMatrixHandle: Int = 0
+    private var texMatrixHandle: Int = 0
+    private var positionHandle: Int = 0
+    private var texCoordHandle: Int = 0
 
     init {
-        // A square that fills the screen in clip space
-        val vertices = floatArrayOf(-1.0f, -1.0f, 0.0f, 1.0f, -1.0f, 0.0f, -1.0f, 1.0f, 0.0f, 1.0f, 1.0f, 0.0f)
-        val texCoords = floatArrayOf(0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f)
-        val drawOrder = shortArrayOf(0, 1, 2, 1, 3, 2) // Order to draw vertices
+        // Full screen quad vertices
+        val vertices = floatArrayOf(
+            -1.0f, -1.0f,  // Bottom-left
+            1.0f, -1.0f,  // Bottom-right
+            -1.0f,  1.0f,  // Top-left
+            1.0f,  1.0f   // Top-right
+        )
 
-        vertexBuffer = ByteBuffer.allocateDirect(vertices.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().put(vertices).apply { position(0) }
-        texCoordBuffer = ByteBuffer.allocateDirect(texCoords.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().put(texCoords).apply { position(0) }
-        drawListBuffer = ByteBuffer.allocateDirect(drawOrder.size * 2).order(ByteOrder.nativeOrder()).asShortBuffer().put(drawOrder).apply { position(0) }
+        // Texture coordinates
+        val texCoords = floatArrayOf(
+            0.0f, 0.0f,  // Bottom-left
+            1.0f, 0.0f,  // Bottom-right
+            0.0f, 1.0f,  // Top-left
+            1.0f, 1.0f   // Top-right
+        )
+
+        vertexBuffer = ByteBuffer.allocateDirect(vertices.size * 4)
+            .order(ByteOrder.nativeOrder()).asFloatBuffer().put(vertices).apply { position(0) }
+
+        texCoordBuffer = ByteBuffer.allocateDirect(texCoords.size * 4)
+            .order(ByteOrder.nativeOrder()).asFloatBuffer().put(texCoords).apply { position(0) }
     }
 
     fun setCameraPreviewSize(width: Int, height: Int) {
-        previewWidth = width
-        previewHeight = height
+        cameraWidth = width
+        cameraHeight = height
+        Log.d(TAG, "Camera preview size set: ${width}x${height}")
+        updateMatrices()
     }
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
-        // Create the OpenGL texture that CameraX will draw to
-        val textures = IntArray(1)
-        GLES20.glGenTextures(1, textures, 0)
-        textureId = textures[0]
-        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
-        // Use high-quality filtering
-        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
-        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1.0f)
 
-        // Create the SurfaceTexture and pass it to MainActivity
-        surfaceTexture = SurfaceTexture(textureId)
-        onSurfaceTextureCreated(surfaceTexture)
+        program = createProgram(vertexShaderCode, fragmentShaderCode)
 
-        // Compile shaders and link into a program
-        val vertexShader = loadShader(GLES20.GL_VERTEX_SHADER, vertexShaderCode)
-        val fragmentShader = loadShader(GLES20.GL_FRAGMENT_SHADER, fragmentShaderCode)
-        program = GLES20.glCreateProgram().also {
-            GLES20.glAttachShader(it, vertexShader)
-            GLES20.glAttachShader(it, fragmentShader)
-            GLES20.glLinkProgram(it)
-        }
-
-        // Get handles to shader variables
         positionHandle = GLES20.glGetAttribLocation(program, "aPosition")
         texCoordHandle = GLES20.glGetAttribLocation(program, "aTexCoord")
         mvpMatrixHandle = GLES20.glGetUniformLocation(program, "uMVPMatrix")
         texMatrixHandle = GLES20.glGetUniformLocation(program, "uTexMatrix")
+
+        val textures = IntArray(1)
+        GLES20.glGenTextures(1, textures, 0)
+        textureId = textures[0]
+
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+
+        surfaceTexture = SurfaceTexture(textureId)
+        onSurfaceTextureCreated(surfaceTexture)
+
+        Log.d(TAG, "Surface created successfully")
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
+        screenWidth = width
+        screenHeight = height
         GLES20.glViewport(0, 0, width, height)
-        surfaceWidth = width
-        surfaceHeight = height
+        Log.d(TAG, "Surface changed: ${width}x${height}")
+        updateMatrices()
     }
 
     override fun onDrawFrame(gl: GL10?) {
-        // Update the texture with the latest camera frame
         surfaceTexture.updateTexImage()
-        surfaceTexture.getTransformMatrix(textureMatrix)
-
-        // Update the transformation matrix
-        updateMatrices()
+        surfaceTexture.getTransformMatrix(transformMatrix)
 
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
         GLES20.glUseProgram(program)
 
-        // Pass data to the shader
+        // Enable vertex arrays
         GLES20.glEnableVertexAttribArray(positionHandle)
-        GLES20.glVertexAttribPointer(positionHandle, 3, GLES20.GL_FLOAT, false, 12, vertexBuffer)
+        GLES20.glVertexAttribPointer(positionHandle, 2, GLES20.GL_FLOAT, false, 8, vertexBuffer)
+
         GLES20.glEnableVertexAttribArray(texCoordHandle)
         GLES20.glVertexAttribPointer(texCoordHandle, 2, GLES20.GL_FLOAT, false, 8, texCoordBuffer)
+
+        // Set matrices
         GLES20.glUniformMatrix4fv(mvpMatrixHandle, 1, false, mvpMatrix, 0)
-        GLES20.glUniformMatrix4fv(texMatrixHandle, 1, false, textureMatrix, 0)
+        GLES20.glUniformMatrix4fv(texMatrixHandle, 1, false, transformMatrix, 0)
+
+        // Bind texture
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
 
-        // Draw the square
-        GLES20.glDrawElements(GLES20.GL_TRIANGLES, 6, GLES20.GL_UNSIGNED_SHORT, drawListBuffer)
+        // Draw
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
 
+        // Cleanup
         GLES20.glDisableVertexAttribArray(positionHandle)
         GLES20.glDisableVertexAttribArray(texCoordHandle)
     }
 
     private fun updateMatrices() {
-        if (surfaceWidth == 0 || surfaceHeight == 0 || previewWidth == 0 || previewHeight == 0) return
+        if (screenWidth == 0 || screenHeight == 0 || cameraWidth == 0 || cameraHeight == 0) {
+            Matrix.setIdentityM(mvpMatrix, 0)
+            return
+        }
 
-        val surfaceAspect = surfaceWidth.toFloat() / surfaceHeight.toFloat()
-        // CameraX provides resolution in the sensor's native orientation (landscape),
-        // so we use previewHeight/previewWidth to get the correct aspect ratio for a portrait phone.
-        val previewAspect = previewHeight.toFloat() / previewWidth.toFloat()
+        // Calculate aspect ratios
+        val screenAspect = screenWidth.toFloat() / screenHeight.toFloat()
+        // Camera gives us width x height, but the image is rotated 90 degrees
+        // So we need to swap the dimensions for aspect ratio calculation
+        val cameraAspect = cameraHeight.toFloat() / cameraWidth.toFloat()
 
-        Matrix.setLookAtM(viewMatrix, 0, 0f, 0f, 1f, 0f, 0f, 0f, 0f, 1f, 0f)
+        Log.d(TAG, "Screen aspect: $screenAspect (${screenWidth}x${screenHeight})")
+        Log.d(TAG, "Camera aspect: $cameraAspect (${cameraWidth}x${cameraHeight})")
 
-        // This projection matrix scales the video to fill the screen, cropping where necessary.
-        if (surfaceAspect > previewAspect) {
-            val scale = surfaceAspect / previewAspect
-            Matrix.orthoM(projectionMatrix, 0, -1f, 1f, -scale, scale, -1f, 1f)
+        // Calculate scale to fill screen (crop mode)
+        val scaleX: Float
+        val scaleY: Float
+
+        if (screenAspect > cameraAspect) {
+            // Screen is wider than camera - fit width, crop height
+            scaleX = 1.0f
+            scaleY = screenAspect / cameraAspect
         } else {
-            val scale = previewAspect / surfaceAspect
-            Matrix.orthoM(projectionMatrix, 0, -scale, scale, -1f, 1f, -1f, 1f)
+            // Screen is taller than camera - fit height, crop width
+            scaleX = cameraAspect / screenAspect
+            scaleY = 1.0f
         }
 
-        val tempMatrix = FloatArray(16)
-        Matrix.multiplyMM(tempMatrix, 0, projectionMatrix, 0, viewMatrix, 0)
+        Log.d(TAG, "Scale: X=$scaleX, Y=$scaleY")
 
-        // This rotation handles the device orientation.
-        val rotationDegrees = when (displayRotation) {
-            Surface.ROTATION_0 -> 0f
-            Surface.ROTATION_90 -> 90f
-            Surface.ROTATION_180 -> 180f
-            Surface.ROTATION_270 -> 270f
-            else -> 0f
+        // Build MVP matrix
+        Matrix.setIdentityM(mvpMatrix, 0)
+        Matrix.scaleM(mvpMatrix, 0, scaleX, scaleY, 1.0f)
+    }
+
+    private fun createProgram(vertexSource: String, fragmentSource: String): Int {
+        val vertexShader = loadShader(GLES20.GL_VERTEX_SHADER, vertexSource)
+        val fragmentShader = loadShader(GLES20.GL_FRAGMENT_SHADER, fragmentSource)
+
+        return GLES20.glCreateProgram().also { program ->
+            GLES20.glAttachShader(program, vertexShader)
+            GLES20.glAttachShader(program, fragmentShader)
+            GLES20.glLinkProgram(program)
+
+            // Check for link errors
+            val linkStatus = IntArray(1)
+            GLES20.glGetProgramiv(program, GLES20.GL_LINK_STATUS, linkStatus, 0)
+            if (linkStatus[0] == 0) {
+                Log.e(TAG, "Error linking program: ${GLES20.glGetProgramInfoLog(program)}")
+                GLES20.glDeleteProgram(program)
+            }
+
+            // Clean up shaders
+            GLES20.glDeleteShader(vertexShader)
+            GLES20.glDeleteShader(fragmentShader)
         }
-        Matrix.setRotateM(mvpMatrix, 0, rotationDegrees, 0f, 0f, -1f)
-        Matrix.multiplyMM(mvpMatrix, 0, tempMatrix, 0, mvpMatrix, 0)
     }
 
     private fun loadShader(type: Int, shaderCode: String): Int {
         return GLES20.glCreateShader(type).also { shader ->
             GLES20.glShaderSource(shader, shaderCode)
             GLES20.glCompileShader(shader)
+
+            // Check for compile errors
+            val compiled = IntArray(1)
+            GLES20.glGetShaderiv(shader, GLES20.GL_COMPILE_STATUS, compiled, 0)
+            if (compiled[0] == 0) {
+                Log.e(TAG, "Error compiling shader: ${GLES20.glGetShaderInfoLog(shader)}")
+                GLES20.glDeleteShader(shader)
+            }
         }
     }
-}
 
+    companion object {
+        private const val TAG = "CameraRenderer"
+    }
+}
